@@ -188,124 +188,6 @@ static uint8_t find_char_and_desr_index(uint16_t handle)
     return error;
 }
 
-void uart_task(void *pvParameters)
-{
-    uart_event_t event;
-    uint8_t total_num = 0;
-    uint8_t current_num = 0;
-
-    for (;;) {
-        //Waiting for UART event.
-        if (!xQueueReceive(spp_uart_queue, (void * ) &event, (TickType_t)portMAX_DELAY))
-            continue;
-
-        switch (event.type) {
-            //Event of UART receving data
-            case UART_DATA:
-                if (!(event.size && is_connected))
-                    break;
-
-                uint8_t * temp = NULL;
-                uint8_t * ntf_value_p = NULL;
-
-                if (!enable_data_ntf) {
-                    ESP_LOGE(GATTS_TABLE_TAG, "%s do not enable data Notify", __func__);
-                    break;
-                }
-
-                temp = (uint8_t *) malloc(sizeof(uint8_t) * event.size);
-
-                if (temp == NULL) {
-                    ESP_LOGE(GATTS_TABLE_TAG, "%s malloc.1 failed", __func__);
-                    break;
-                }
-
-                memset(temp, 0x0, event.size);
-
-                uart_read_bytes(UART_NUM_0, temp, event.size, portMAX_DELAY);
-
-                if (event.size <= (spp_mtu_size - 3)) {
-                    esp_ble_gatts_send_indicate(spp_gatts_if, spp_conn_id, spp_handle_table[SPP_IDX_SPP_DATA_NTY_VAL], event.size, temp, false);
-                } else if (event.size > (spp_mtu_size - 3)) {
-                    if ((event.size % (spp_mtu_size - 7)) == 0) {
-                        total_num = event.size / (spp_mtu_size - 7);
-                    } else {
-                        total_num = event.size / (spp_mtu_size - 7) + 1;
-                    }
-
-                    current_num = 1;
-
-                    ntf_value_p = (uint8_t *)malloc((spp_mtu_size - 3) * sizeof(uint8_t));
-
-                    if (ntf_value_p == NULL) {
-                        ESP_LOGE(GATTS_TABLE_TAG, "%s malloc.2 failed", __func__);
-                        free(temp);
-                        break;
-                    }
-
-                    while (current_num <= total_num) {
-                        if (current_num < total_num) {
-                            ntf_value_p[0] = '#';
-                            ntf_value_p[1] = '#';
-                            ntf_value_p[2] = total_num;
-                            ntf_value_p[3] = current_num;
-
-                            memcpy(ntf_value_p + 4, temp + (current_num - 1) * (spp_mtu_size - 7), (spp_mtu_size - 7));
-
-                            esp_ble_gatts_send_indicate(spp_gatts_if, spp_conn_id, spp_handle_table[SPP_IDX_SPP_DATA_NTY_VAL], (spp_mtu_size - 3), ntf_value_p, false);
-                        } else if (current_num == total_num) {
-                            ntf_value_p[0] = '#';
-                            ntf_value_p[1] = '#';
-                            ntf_value_p[2] = total_num;
-                            ntf_value_p[3] = current_num;
-
-                            memcpy(ntf_value_p + 4, temp + (current_num - 1) * (spp_mtu_size-7), (event.size - (current_num - 1) * (spp_mtu_size - 7)));
-
-                            esp_ble_gatts_send_indicate(spp_gatts_if, spp_conn_id, spp_handle_table[SPP_IDX_SPP_DATA_NTY_VAL], (event.size - (current_num - 1) * (spp_mtu_size - 7) + 4), ntf_value_p, false);
-                        }
-
-                        vTaskDelay(20 / portTICK_PERIOD_MS);
-
-                        current_num++;
-                    }
-
-                    free(ntf_value_p);
-                }
-
-                free(temp);
-                break;
-            default:
-                break;
-        }
-    }
-
-    vTaskDelete(NULL);
-}
-
-static void spp_uart_init(void)
-{
-    uart_config_t uart_config = {
-        .baud_rate = 115200,
-        .data_bits = UART_DATA_8_BITS,
-        .parity = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_RTS,
-        .rx_flow_ctrl_thresh = 122,
-        .source_clk = UART_SCLK_DEFAULT,
-    };
-
-    //Install UART driver, and get the queue.
-    uart_driver_install(UART_NUM_0, 4096, 8192, 10, &spp_uart_queue, 0);
-
-    //Set UART parameters
-    uart_param_config(UART_NUM_0, &uart_config);
-
-    //Set UART pins
-    uart_set_pin(UART_NUM_0, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-
-    xTaskCreate(uart_task, "uTask", 2048, (void*)UART_NUM_0, 8, NULL);
-}
-
 void spp_cmd_task(void * arg)
 {
     spp_data_t *spp_message;
@@ -351,8 +233,6 @@ static void ml41_connection_task()
 
 static void spp_task_init(void)
 {
-    spp_uart_init();
-
     ml41_request_queue = xQueueCreate(32, sizeof(void *));
     xTaskCreate(ml41_connection_task, "ml41_connection_task", 16384, NULL, configMAX_PRIORITIES - 2, NULL);
 
@@ -363,6 +243,7 @@ static void spp_task_init(void)
 static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
 {
     esp_err_t err;
+
     ESP_LOGE(GATTS_TABLE_TAG, "GAP_EVT, event %d", event);
 
     switch (event) {

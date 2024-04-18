@@ -1,10 +1,3 @@
-/*
- * SPDX-FileCopyrightText: 2021-2022 Espressif Systems (Shanghai) CO LTD
- *
- * SPDX-License-Identifier: Unlicense OR CC0-1.0
- */
-
-
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -41,8 +34,6 @@ static const uint8_t spp_adv_data[23] = {
 static uint16_t spp_mtu_size = 23;
 static uint16_t spp_conn_id = 0xffff;
 static esp_gatt_if_t spp_gatts_if = 0xff;
-QueueHandle_t spp_uart_queue = NULL;
-static QueueHandle_t cmd_cmd_queue = NULL;
 static QueueHandle_t ml41_request_queue = NULL;
 
 static bool enable_data_ntf = false;
@@ -121,7 +112,6 @@ static struct gatts_profile_inst spp_profile_tab[SPP_PROFILE_NUM] = {
  *  SPP PROFILE ATTRIBUTES
  ****************************************************************************************
  */
-
 #define CHAR_DECLARATION_SIZE   (sizeof(uint8_t))
 static const uint16_t primary_service_uuid = ESP_GATT_UUID_PRI_SERVICE;
 static const uint16_t character_declaration_uuid = ESP_GATT_UUID_CHAR_DECLARE;
@@ -146,32 +136,32 @@ static const uint8_t  spp_data_notify_ccc[2] = { 0x00, 0x00 };
 static const esp_gatts_attr_db_t spp_gatt_db[SPP_IDX_NB] =
 {
     //SPP -  Service Declaration
-    [SPP_IDX_SVC]                      	=
+    [SPP_IDX_SVC] =
     {{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *) &primary_service_uuid, ESP_GATT_PERM_READ,
     sizeof(spp_service_uuid), sizeof(spp_service_uuid), (uint8_t *) &spp_service_uuid}},
 
     //SPP -  data receive characteristic Declaration
-    [SPP_IDX_SPP_DATA_RECV_CHAR]            =
+    [SPP_IDX_SPP_DATA_RECV_CHAR] =
     {{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *) &character_declaration_uuid, ESP_GATT_PERM_READ,
     CHAR_DECLARATION_SIZE,CHAR_DECLARATION_SIZE, (uint8_t *) &char_prop_read_write}},
 
     //SPP -  data receive characteristic Value
-    [SPP_IDX_SPP_DATA_RECV_VAL]             	=
+    [SPP_IDX_SPP_DATA_RECV_VAL] =
     {{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *) &spp_data_receive_uuid, ESP_GATT_PERM_READ|ESP_GATT_PERM_WRITE,
     SPP_DATA_MAX_LEN,sizeof(spp_data_receive_val), (uint8_t *) spp_data_receive_val}},
 
     //SPP -  data notify characteristic Declaration
-    [SPP_IDX_SPP_DATA_NOTIFY_CHAR]  =
+    [SPP_IDX_SPP_DATA_NOTIFY_CHAR] =
     {{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *) &character_declaration_uuid, ESP_GATT_PERM_READ,
     CHAR_DECLARATION_SIZE,CHAR_DECLARATION_SIZE, (uint8_t *) &char_prop_read_notify}},
 
     //SPP -  data notify characteristic Value
-    [SPP_IDX_SPP_DATA_NTY_VAL]   =
+    [SPP_IDX_SPP_DATA_NTY_VAL] =
     {{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *) &spp_data_notify_uuid, ESP_GATT_PERM_READ,
     SPP_DATA_MAX_LEN, sizeof(spp_data_notify_val), (uint8_t *) spp_data_notify_val}},
 
     // //SPP -  data notify characteristic - Client Characteristic Configuration Descriptor
-    [SPP_IDX_SPP_DATA_NTF_CFG]         =
+    [SPP_IDX_SPP_DATA_NTF_CFG] =
     {{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *)&character_client_config_uuid, ESP_GATT_PERM_READ|ESP_GATT_PERM_WRITE,
     sizeof(uint16_t),sizeof(spp_data_notify_ccc), (uint8_t *)spp_data_notify_ccc}},
 };
@@ -188,14 +178,14 @@ static uint8_t find_char_and_desr_index(uint16_t handle)
     return error;
 }
 
-void spp_cmd_task(void * arg)
+static void ml41_connection_task()
 {
     spp_data_t *spp_message;
 
     for(;;) {
         vTaskDelay(50 / portTICK_PERIOD_MS);
 
-        if (!xQueueReceive(cmd_cmd_queue, &spp_message, portMAX_DELAY))
+        if (!xQueueReceive(ml41_request_queue, &spp_message, portMAX_DELAY))
             continue;
 
         ESP_LOGI(GATTS_TABLE_TAG, "message size: %d message ptr: %p data ptr: %p \r\n", spp_message->size, spp_message, spp_message->data);
@@ -214,30 +204,11 @@ void spp_cmd_task(void * arg)
     vTaskDelete(NULL);
 }
 
-static void ml41_connection_task()
-{
-    uint8_t * cmd_id;
-
-    for(;;) {
-        vTaskDelay(50 / portTICK_PERIOD_MS);
-
-        if (!xQueueReceive(ml41_request_queue, &cmd_id, portMAX_DELAY))
-            continue;
-
-        esp_log_buffer_hex(GATTS_TABLE_TAG, (char *)(cmd_id), strlen((char *)cmd_id));
-        free(cmd_id);
-    }
-
-    vTaskDelete(NULL);
-}
-
 static void spp_task_init(void)
 {
     ml41_request_queue = xQueueCreate(32, sizeof(void *));
-    xTaskCreate(ml41_connection_task, "ml41_connection_task", 16384, NULL, configMAX_PRIORITIES - 2, NULL);
 
-    cmd_cmd_queue = xQueueCreate(10, sizeof(void *));
-    xTaskCreate(spp_cmd_task, "spp_cmd_task", 2048, NULL, 10, NULL);
+    xTaskCreate(ml41_connection_task, "ml41_connection_task", 16384, NULL, configMAX_PRIORITIES - 2, NULL);
 }
 
 static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)

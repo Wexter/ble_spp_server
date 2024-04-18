@@ -7,6 +7,7 @@
 #include "esp_bt.h"
 #include "driver/uart.h"
 #include "string.h"
+#include "driver/gpio.h"
 
 #include "esp_gap_ble_api.h"
 #include "esp_gatts_api.h"
@@ -98,6 +99,46 @@ enum EcuRequestID {
     EcuRequestMax
 };
 
+typedef enum {
+    Disconnected,
+    Initialization,
+    Connected
+} ECUConnectionState_t;
+
+#define LED_GPIO 2
+#define LED_BLINK_DELAY 200
+#define delay(ms) vTaskDelay(ms / portTICK_PERIOD_MS)
+
+void enable_led(void)
+{
+    gpio_set_level(LED_GPIO, 1);
+}
+
+void disable_led(void)
+{
+    gpio_set_level(LED_GPIO, 0);
+}
+
+void blink_led(uint8_t count)
+{
+    disable_led();
+
+    do {
+        delay(LED_BLINK_DELAY);
+        enable_led();
+        delay(LED_BLINK_DELAY);
+        disable_led();
+    } while (--count > 0);
+}
+
+void configure_led(void)
+{
+    gpio_reset_pin(LED_GPIO);
+
+    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
+}
+static int ecu_connection_state = Disconnected;
+
 static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param);
 
 /* One gatt-based profile one app_id and one gatts_if, this array will store the gatts_if returned by ESP_GATTS_REG_EVT */
@@ -178,37 +219,78 @@ static uint8_t find_char_and_desr_index(uint16_t handle)
     return error;
 }
 
+void send_notification(spp_data_t *spp_message)
+{
+    if (!enable_data_ntf) {
+        ESP_LOGE(GATTS_TABLE_TAG, "%s do not enable data Notify", __func__);
+
+        return;
+    }
+
+    esp_ble_gatts_send_indicate(spp_gatts_if, spp_conn_id, spp_handle_table[SPP_IDX_SPP_DATA_NTY_VAL], spp_message->size, spp_message->data, false);
+}
+
+void set_connection_state(ECUConnectionState_t newState)
+{
+    ecu_connection_state = newState;
+
+    // spp_data_t spp_message = {
+    //     .data = { 0x01, (uint8_t) newState },
+    //     .size = 2
+    // };
+
+    // send_notification(&spp_message);
+}
+
 static void ml41_connection_task()
 {
     spp_data_t *spp_message;
 
+    set_connection_state(Initialization);
+
+    blink_led(10);
+    // vTaskDelay(5000 / portTICK_PERIOD_MS);
+
+    set_connection_state(Connected);
+
+    spp_data_t *no_data_notify = malloc(sizeof(spp_data_t)); 
+
+    no_data_notify->data = malloc(5);
+
+    no_data_notify->data[0] = 0x04;
+    no_data_notify->data[1] = 0x03;
+    no_data_notify->data[2] = 0x00;
+    no_data_notify->data[3] = 0x09;
+    no_data_notify->data[4] = 0x03;
+
+    no_data_notify->size = 5;
+
     for(;;) {
-        vTaskDelay(50 / portTICK_PERIOD_MS);
+        // vTaskDelay(50 / portTICK_PERIOD_MS);
 
-        if (!xQueueReceive(ml41_request_queue, &spp_message, portMAX_DELAY))
-            continue;
+        if (xQueueReceive(ml41_request_queue, &spp_message, 50 / portTICK_PERIOD_MS)) {
+            ESP_LOGI(GATTS_TABLE_TAG, "message size: %d message ptr: %p data ptr: %p \r\n", spp_message->size, spp_message, spp_message->data);
 
-        ESP_LOGI(GATTS_TABLE_TAG, "message size: %d message ptr: %p data ptr: %p \r\n", spp_message->size, spp_message, spp_message->data);
+            ESP_LOG_BUFFER_HEXDUMP(GATTS_TABLE_TAG, spp_message->data, spp_message->size, ESP_LOG_INFO);
 
-        ESP_LOG_BUFFER_HEXDUMP(GATTS_TABLE_TAG, spp_message->data, spp_message->size, ESP_LOG_INFO);
+            send_notification(spp_message);
 
-        if (enable_data_ntf)
-            esp_ble_gatts_send_indicate(spp_gatts_if, spp_conn_id, spp_handle_table[SPP_IDX_SPP_DATA_NTY_VAL], spp_message->size, spp_message->data, false);
-        else
-            ESP_LOGE(GATTS_TABLE_TAG, "%s do not enable data Notify", __func__);
+            free(spp_message->data);
+            free(spp_message);
+        } else {
+            send_notification(no_data_notify);
+        }
 
-        free(spp_message->data);
-        free(spp_message);
+        // if (enable_data_ntf)
+        //     esp_ble_gatts_send_indicate(spp_gatts_if, spp_conn_id, spp_handle_table[SPP_IDX_SPP_DATA_NTY_VAL], spp_message->size, spp_message->data, false);
+        // else
+        //     ESP_LOGE(GATTS_TABLE_TAG, "%s do not enable data Notify", __func__);
     }
 
+    free(no_data_notify->data);
+    free(no_data_notify);
+
     vTaskDelete(NULL);
-}
-
-static void spp_task_init(void)
-{
-    ml41_request_queue = xQueueCreate(32, sizeof(void *));
-
-    xTaskCreate(ml41_connection_task, "ml41_connection_task", 16384, NULL, configMAX_PRIORITIES - 2, NULL);
 }
 
 static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
@@ -253,20 +335,36 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
     	case ESP_GATTS_WRITE_EVT: {
             if (p_data->write.is_prep == true)
                 break;
+
     	    res = find_char_and_desr_index(p_data->write.handle);
+
             ESP_LOGI(GATTS_TABLE_TAG, "ESP_GATTS_WRITE_EVT : handle = %d", res);
+
             if (res == SPP_IDX_SPP_DATA_NTF_CFG) {
                 if ((p_data->write.len == 2) && (p_data->write.value[1] == 0x00))
                     enable_data_ntf = p_data->write.value[0] == 0x01;
             } else if (res == SPP_IDX_SPP_DATA_RECV_VAL) {
-                spp_data_t *spp_message = (spp_data_t *) malloc(sizeof(spp_data_t));
+                if (p_data->write.len > 1) {
+                    spp_data_t *spp_message = (spp_data_t *) malloc(sizeof(spp_data_t));
 
-                spp_message->size = p_data->write.len;
-                spp_message->data = (uint8_t *) malloc(p_data->write.len);
+                    spp_message->size = p_data->write.len;
+                    spp_message->data = (uint8_t *) malloc(p_data->write.len);
 
-                memcpy(spp_message->data, p_data->write.value, p_data->write.len);
+                    memcpy(spp_message->data, p_data->write.value, p_data->write.len);
 
-                xQueueSend(cmd_cmd_queue, &spp_message, 10 / portTICK_PERIOD_MS);
+                    xQueueSend(ml41_request_queue, &spp_message, 10 / portTICK_PERIOD_MS);
+                    break;
+                }
+
+                switch (p_data->write.value[0])
+                {
+                    case 0x01: // start ecu connection
+                        xTaskCreate(ml41_connection_task, "ml41_connection_task", 16384, NULL, configMAX_PRIORITIES - 2, NULL);
+                        break;
+                    case 0x02:
+                    default:
+                        break;
+                }
             }
       	 	break;
     	}
@@ -365,6 +463,8 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
 
 void app_main(void)
 {
+    configure_led();
+
     esp_err_t ret;
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
 
@@ -391,12 +491,15 @@ void app_main(void)
     }
 
     ESP_LOGI(GATTS_TABLE_TAG, "%s init bluetooth", __func__);
+
     esp_bluedroid_config_t bluedroid_cfg = BT_BLUEDROID_INIT_CONFIG_DEFAULT();
+
     ret = esp_bluedroid_init_with_cfg(&bluedroid_cfg);
     if (ret) {
         ESP_LOGE(GATTS_TABLE_TAG, "%s init bluetooth failed: %s", __func__, esp_err_to_name(ret));
         return;
     }
+
     ret = esp_bluedroid_enable();
     if (ret) {
         ESP_LOGE(GATTS_TABLE_TAG, "%s enable bluetooth failed: %s", __func__, esp_err_to_name(ret));
@@ -407,7 +510,7 @@ void app_main(void)
     esp_ble_gap_register_callback(gap_event_handler);
     esp_ble_gatts_app_register(ESP_SPP_APP_ID);
 
-    spp_task_init();
+    ml41_request_queue = xQueueCreate(32, sizeof(void *));
 
     return;
 }
